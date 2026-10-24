@@ -140,6 +140,7 @@ export default function MeClient({ config: initialConfig }: { config: MeConfig }
     const spotifyProgressLastStateUpdateRef = useRef<number>(0);
     const galleryVideoRefs = useRef<Record<string, HTMLVideoElement | null>>({});
     const galleryHlsRefs = useRef<Record<string, { destroy: () => void }>>({});
+    const galleryRetryingRefs = useRef<Set<string>>(new Set());
     const [playingGalleryVideo, setPlayingGalleryVideo] = useState<string | null>(null);
     const [unmutedGalleryVideos, setUnmutedGalleryVideos] = useState<Set<string>>(() => new Set());
     const [galleryVideoErrors, setGalleryVideoErrors] = useState<Set<string>>(() => new Set());
@@ -186,13 +187,24 @@ export default function MeClient({ config: initialConfig }: { config: MeConfig }
         const player = new Hls({ enableWorker: false, lowLatencyMode: false, maxBufferLength: 20, maxMaxBufferLength: 40 });
         galleryHlsRefs.current[id] = player;
         await new Promise<void>((resolve, reject) => {
+            let recoveryAttempts = 0;
             const cleanup = () => {
                 player.off(Hls.Events.MANIFEST_PARSED, onManifestParsed);
                 player.off(Hls.Events.ERROR, onHlsError);
             };
             const onManifestParsed = () => { cleanup(); resolve(); };
-            const onHlsError = (_event: string, data: { fatal?: boolean; details?: string }) => {
+            const onHlsError = (_event: string, data: { fatal?: boolean; details?: string; type?: string }) => {
                 if (!data.fatal) return;
+                if (data.type === Hls.ErrorTypes.NETWORK_ERROR && recoveryAttempts < 2) {
+                    recoveryAttempts += 1;
+                    player.startLoad();
+                    return;
+                }
+                if (data.type === Hls.ErrorTypes.MEDIA_ERROR && recoveryAttempts < 2) {
+                    recoveryAttempts += 1;
+                    player.recoverMediaError();
+                    return;
+                }
                 cleanup();
                 player.destroy();
                 delete galleryHlsRefs.current[id];
@@ -205,9 +217,38 @@ export default function MeClient({ config: initialConfig }: { config: MeConfig }
         });
     }, []);
 
-    const retryGalleryVideo = useCallback(async (id: string, url: string) => {
+    const initializeGalleryVideo = useCallback(async (id: string, url: string) => {
         const video = galleryVideoRefs.current[id];
         if (!video) return;
+
+        if (!isHlsStream(url)) {
+            if (video.src !== url) {
+                video.src = url;
+                video.load();
+            }
+            return;
+        }
+
+        // Safari has native HLS playback. All other browsers are deliberately
+        // source-free in React and are attached through MediaSource below. If
+        // React controls the .m3u8 src, a state update can reset hls.js and
+        // cause the exact permanent playback error shown in the gallery.
+        if (video.canPlayType(HLS_MIME_TYPE)) {
+            if (video.src !== url) {
+                video.src = url;
+                video.load();
+            }
+            return;
+        }
+
+        await prepareGalleryVideo(id, url);
+    }, [prepareGalleryVideo]);
+
+    const retryGalleryVideo = useCallback(async (id: string, url: string) => {
+        const video = galleryVideoRefs.current[id];
+        if (!video || galleryRetryingRefs.current.has(id)) return;
+
+        galleryRetryingRefs.current.add(id);
 
         galleryHlsRefs.current[id]?.destroy();
         delete galleryHlsRefs.current[id];
@@ -218,19 +259,17 @@ export default function MeClient({ config: initialConfig }: { config: MeConfig }
         });
 
         try {
-            if (isHlsStream(url) && !video.canPlayType(HLS_MIME_TYPE)) {
-                video.removeAttribute('src');
-                video.load();
-                await prepareGalleryVideo(id, url);
-            } else {
-                video.src = url;
-                video.load();
-            }
+            video.pause();
+            video.removeAttribute('src');
+            video.load();
+            await initializeGalleryVideo(id, url);
             await video.play();
         } catch {
             setGalleryVideoErrors(current => new Set(current).add(id));
+        } finally {
+            galleryRetryingRefs.current.delete(id);
         }
-    }, [prepareGalleryVideo]);
+    }, [initializeGalleryVideo]);
 
     useEffect(() => () => {
         Object.values(galleryHlsRefs.current).forEach(player => player.destroy());
@@ -243,11 +282,8 @@ export default function MeClient({ config: initialConfig }: { config: MeConfig }
             .flatMap(item => {
                 const video = galleryVideoRefs.current[item.id];
                 if (!video) return [];
-                // Initialise MediaSource before the browser attempts an HLS URL
-                // it cannot natively decode. This avoids the permanent error
-                // overlay seen on Chrome for Android.
-                if (isHlsStream(item.url) && !video.canPlayType(HLS_MIME_TYPE)) {
-                    void prepareGalleryVideo(item.id, item.url)
+                if (isHlsStream(item.url)) {
+                    void initializeGalleryVideo(item.id, item.url)
                         .then(() => {
                             setGalleryVideoErrors(current => {
                                 const next = new Set(current);
@@ -281,7 +317,7 @@ export default function MeClient({ config: initialConfig }: { config: MeConfig }
                 return [observer];
             });
         return () => observers.forEach(observer => observer.disconnect());
-    }, [config.gallery, prepareGalleryVideo]);
+    }, [config.gallery, initializeGalleryVideo]);
 
     useEffect(() => {
         setIsMounted(true);
@@ -1356,7 +1392,10 @@ export default function MeClient({ config: initialConfig }: { config: MeConfig }
                                         {item.type === 'video' ? (
                                             <video
                                                 ref={element => { galleryVideoRefs.current[item.id] = element; }}
-                                                src={item.url}
+                                                // HLS is assigned imperatively by initializeGalleryVideo.
+                                                // Keeping React out of the HLS src prevents re-renders from
+                                                // replacing the MediaSource URL with the raw manifest.
+                                                src={isHlsStream(item.url) ? undefined : item.url}
                                                 poster={muxPosterUrl(item.url)}
                                                 aria-label={item.caption || 'Gallery video'}
                                                 className="w-full h-full object-cover"
@@ -1374,17 +1413,11 @@ export default function MeClient({ config: initialConfig }: { config: MeConfig }
                                                 onPlay={() => setPlayingGalleryVideo(item.id)}
                                                 onPause={() => setPlayingGalleryVideo(active => active === item.id ? null : active)}
                                                 onError={() => {
-                                                    if (!isHlsStream(item.url) || galleryHlsRefs.current[item.id]) {
+                                                    if (!isHlsStream(item.url)) {
                                                         setGalleryVideoErrors(current => new Set(current).add(item.id));
                                                         return;
                                                     }
-                                                    const video = galleryVideoRefs.current[item.id];
-                                                    void prepareGalleryVideo(item.id, item.url)
-                                                        .then(() => video?.play())
-                                                        .then(() => setGalleryVideoErrors(current => {
-                                                            const next = new Set(current); next.delete(item.id); return next;
-                                                        }))
-                                                        .catch(() => setGalleryVideoErrors(current => new Set(current).add(item.id)));
+                                                    void retryGalleryVideo(item.id, item.url);
                                                 }}
                                                 onLoadedData={() => setGalleryVideoErrors(current => {
                                                     const next = new Set(current);
@@ -1436,7 +1469,7 @@ export default function MeClient({ config: initialConfig }: { config: MeConfig }
                                                             try {
                                                                 await video.play();
                                                             } catch {
-                                                                try { await prepareGalleryVideo(item.id, item.url); await video.play(); } catch { setPlayingGalleryVideo(null); }
+                                                                try { await retryGalleryVideo(item.id, item.url); } catch { setPlayingGalleryVideo(null); }
                                                             }
                                                         } else {
                                                             video.pause();
