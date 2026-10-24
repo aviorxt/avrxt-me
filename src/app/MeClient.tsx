@@ -205,6 +205,7 @@ export default function MeClient({ config: initialConfig }: { config: MeConfig }
                 resolve();
             };
             const onHlsError = (_event: string, data: { fatal?: boolean; details?: string; type?: string }) => {
+                console.warn('[AVRXT profile] Mux HLS event', { id, fatal: data.fatal, type: data.type, details: data.details });
                 if (!data.fatal) return;
                 if (data.type === Hls.ErrorTypes.NETWORK_ERROR && recoveryAttempts < 2) {
                     recoveryAttempts += 1;
@@ -1429,6 +1430,12 @@ export default function MeClient({ config: initialConfig }: { config: MeConfig }
                                                 onPlay={() => setPlayingGalleryVideo(item.id)}
                                                 onPause={() => setPlayingGalleryVideo(active => active === item.id ? null : active)}
                                                 onError={() => {
+                                                    const mediaError = galleryVideoRefs.current[item.id]?.error;
+                                                    console.warn('[AVRXT profile] Gallery media error', {
+                                                        id: item.id,
+                                                        code: mediaError?.code,
+                                                        message: mediaError?.message,
+                                                    });
                                                     if (!isHlsStream(item.url)) {
                                                         setGalleryVideoErrors(current => new Set(current).add(item.id));
                                                         return;
