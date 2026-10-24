@@ -11,7 +11,10 @@ const contentSecurityPolicy = [
   "style-src 'self' 'unsafe-inline'",
   "img-src 'self' data: blob: https:",
   "media-src 'self' blob: https:",
-  "connect-src 'self' https://api.avrxt.dev https://*.supabase.co wss://*.supabase.co wss://api.lanyard.rest https://stream.mux.com https://image.mux.com",
+  // Mux master playlists hand off to signed Fastly delivery hosts under
+  // *.mux.com. Restricting this to stream.mux.com blocks those manifests
+  // (and their media segments) in Chromium through CSP.
+  "connect-src 'self' https://api.avrxt.dev https://*.supabase.co wss://*.supabase.co wss://api.lanyard.rest https://*.mux.com",
   "worker-src 'self' blob:",
   "frame-src 'self' https://www.youtube.com https://www.youtube-nocookie.com",
   "upgrade-insecure-requests",
