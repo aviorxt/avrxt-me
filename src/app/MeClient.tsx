@@ -188,11 +188,22 @@ export default function MeClient({ config: initialConfig }: { config: MeConfig }
         galleryHlsRefs.current[id] = player;
         await new Promise<void>((resolve, reject) => {
             let recoveryAttempts = 0;
-            const cleanup = () => {
+            let manifestReady = false;
+            const removeStartupListeners = () => {
                 player.off(Hls.Events.MANIFEST_PARSED, onManifestParsed);
+            };
+            const cleanup = () => {
+                removeStartupListeners();
                 player.off(Hls.Events.ERROR, onHlsError);
             };
-            const onManifestParsed = () => { cleanup(); resolve(); };
+            const onManifestParsed = () => {
+                // Keep the fatal-error listener after startup. Mux can move a
+                // viewer between CDN edges after the manifest is parsed, and
+                // hls.js needs to recover a late network/media error itself.
+                manifestReady = true;
+                removeStartupListeners();
+                resolve();
+            };
             const onHlsError = (_event: string, data: { fatal?: boolean; details?: string; type?: string }) => {
                 if (!data.fatal) return;
                 if (data.type === Hls.ErrorTypes.NETWORK_ERROR && recoveryAttempts < 2) {
@@ -208,7 +219,12 @@ export default function MeClient({ config: initialConfig }: { config: MeConfig }
                 cleanup();
                 player.destroy();
                 delete galleryHlsRefs.current[id];
-                reject(new Error(data.details || 'The video stream could not be loaded.'));
+                const error = new Error(data.details || 'The video stream could not be loaded.');
+                if (manifestReady) {
+                    setGalleryVideoErrors(current => new Set(current).add(id));
+                } else {
+                    reject(error);
+                }
             };
             player.on(Hls.Events.MANIFEST_PARSED, onManifestParsed);
             player.on(Hls.Events.ERROR, onHlsError);
