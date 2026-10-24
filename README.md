@@ -15,7 +15,6 @@ Copy [`.env.example`](./.env.example) into the Amplify branch environment. Only 
 - `NEXT_PUBLIC_SUPABASE_URL`
 - `NEXT_PUBLIC_SUPABASE_ANON_KEY`
 - `NEXT_PUBLIC_API_URL`
-- `NEXT_PUBLIC_EDGE_BASE_URL`
 - `NEXT_PUBLIC_MAIN_SITE_URL`
 
 The Supabase anonymous key is safe here only because the public profile reads are constrained by Supabase Row Level Security. Never add service-role keys, Discord secrets, AWS credentials, or admin session secrets to this project.
