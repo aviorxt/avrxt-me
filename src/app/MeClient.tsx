@@ -55,6 +55,8 @@ const LOCAL_QUOTES = [
 
 const pickQuote = () => LOCAL_QUOTES[Math.floor(Math.random() * LOCAL_QUOTES.length)];
 const isHlsStream = (url: string) => /\.m3u8(?:$|[?#])/i.test(url);
+const HLS_MIME_TYPE = 'application/vnd.apple.mpegurl';
+const ACTIVE_SPOTIFY_SYNC_MS = 10_000;
 const muxPosterUrl = (url: string) => {
     const playbackId = url.match(/^https:\/\/stream\.mux\.com\/([^/?#]+)\.m3u8(?:[?#].*)?$/i)?.[1];
     return playbackId ? `https://image.mux.com/${playbackId}/thumbnail.jpg?width=720&height=720&fit_mode=preserve&time=0` : undefined;
@@ -173,9 +175,8 @@ export default function MeClient({ config: initialConfig }: { config: MeConfig }
     const prepareGalleryVideo = useCallback(async (id: string, url: string) => {
         const video = galleryVideoRefs.current[id];
         if (!video || !isHlsStream(url) || galleryHlsRefs.current[id]) return;
-        // Start with the platform player. Chrome on this device can play Mux HLS
-        // natively, and this avoids introducing MediaSource when it is unnecessary.
-        // hls.js is reserved for an actual native playback error below.
+        // Safari can use HLS natively. Chromium-based browsers need hls.js to
+        // fetch and attach the Mux manifest through MediaSource.
         const { default: Hls } = await import('hls.js');
         if (!Hls.isSupported()) {
             throw new Error('HLS playback is not supported by this browser.');
@@ -204,6 +205,33 @@ export default function MeClient({ config: initialConfig }: { config: MeConfig }
         });
     }, []);
 
+    const retryGalleryVideo = useCallback(async (id: string, url: string) => {
+        const video = galleryVideoRefs.current[id];
+        if (!video) return;
+
+        galleryHlsRefs.current[id]?.destroy();
+        delete galleryHlsRefs.current[id];
+        setGalleryVideoErrors(current => {
+            const next = new Set(current);
+            next.delete(id);
+            return next;
+        });
+
+        try {
+            if (isHlsStream(url) && !video.canPlayType(HLS_MIME_TYPE)) {
+                video.removeAttribute('src');
+                video.load();
+                await prepareGalleryVideo(id, url);
+            } else {
+                video.src = url;
+                video.load();
+            }
+            await video.play();
+        } catch {
+            setGalleryVideoErrors(current => new Set(current).add(id));
+        }
+    }, [prepareGalleryVideo]);
+
     useEffect(() => () => {
         Object.values(galleryHlsRefs.current).forEach(player => player.destroy());
         galleryHlsRefs.current = {};
@@ -215,6 +243,28 @@ export default function MeClient({ config: initialConfig }: { config: MeConfig }
             .flatMap(item => {
                 const video = galleryVideoRefs.current[item.id];
                 if (!video) return [];
+                // Initialise MediaSource before the browser attempts an HLS URL
+                // it cannot natively decode. This avoids the permanent error
+                // overlay seen on Chrome for Android.
+                if (isHlsStream(item.url) && !video.canPlayType(HLS_MIME_TYPE)) {
+                    void prepareGalleryVideo(item.id, item.url)
+                        .then(() => {
+                            setGalleryVideoErrors(current => {
+                                const next = new Set(current);
+                                next.delete(item.id);
+                                return next;
+                            });
+                            // Autoplay may still be denied by a device setting;
+                            // this does not mean that the stream itself failed.
+                            return video.play().catch(() => setPlayingGalleryVideo(active => active === item.id ? null : active));
+                        })
+                        .then(() => setGalleryVideoErrors(current => {
+                            const next = new Set(current);
+                            next.delete(item.id);
+                            return next;
+                        }))
+                        .catch(() => setGalleryVideoErrors(current => new Set(current).add(item.id)));
+                }
                 const observer = new IntersectionObserver(entries => {
                     for (const entry of entries) {
                         if (entry.isIntersecting) {
@@ -490,15 +540,15 @@ export default function MeClient({ config: initialConfig }: { config: MeConfig }
 
             // Reduce background churn; resync quickly when the tab returns.
             if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
-                scheduleNext(5 * 60_000);
+                scheduleNext(60_000);
                 return;
             }
 
-            // Supabase Realtime delivers prompt updates. This fallback is deliberately
-            // slow so open profile tabs do not continually consume origin capacity.
+            // Supabase Realtime is the WebSocket fan-out channel. Polling keeps the
+            // source fresh when Spotify changes state before any database event.
             const now = Date.now();
-            if (lastNowPlayingFetchAt && now - lastNowPlayingFetchAt < 60_000) {
-                scheduleNext(60_000 - (now - lastNowPlayingFetchAt));
+            if (lastNowPlayingFetchAt && now - lastNowPlayingFetchAt < ACTIVE_SPOTIFY_SYNC_MS) {
+                scheduleNext(ACTIVE_SPOTIFY_SYNC_MS - (now - lastNowPlayingFetchAt));
                 return;
             }
             lastNowPlayingFetchAt = now;
@@ -512,9 +562,7 @@ export default function MeClient({ config: initialConfig }: { config: MeConfig }
                 inFlight = new AbortController();
 
                 const res = await fetch(spotifyApiUrl, {
-          // Realtime Supabase events keep this fresh. Let the browser reuse the
-          // short-lived edge response when polling is only a fallback.
-          cache: 'default',
+                    cache: 'no-store',
                     signal: inFlight.signal,
                     headers: { accept: 'application/json' }
                 });
@@ -525,11 +573,11 @@ export default function MeClient({ config: initialConfig }: { config: MeConfig }
 
                 const normalized = normalizeIncoming(data);
                 applySpotifyState(normalized);
-                scheduleNext(60_000);
+                scheduleNext(ACTIVE_SPOTIFY_SYNC_MS);
             } catch (e: any) {
                 if (e?.name === 'AbortError') return;
                 console.error('Spotify sync failed', e);
-                scheduleNext(60_000);
+                scheduleNext(ACTIVE_SPOTIFY_SYNC_MS);
             }
         };
 
@@ -554,8 +602,7 @@ export default function MeClient({ config: initialConfig }: { config: MeConfig }
                     const mapped = normalizeIncoming(payload.new);
                     if (!mapped) return;
                     applySpotifyState(mapped);
-                    // Keep polling cadence predictable (limits-friendly).
-                    scheduleNext(60_000);
+                    scheduleNext(ACTIVE_SPOTIFY_SYNC_MS);
                 }
             )
             .subscribe();
@@ -1339,6 +1386,11 @@ export default function MeClient({ config: initialConfig }: { config: MeConfig }
                                                         }))
                                                         .catch(() => setGalleryVideoErrors(current => new Set(current).add(item.id)));
                                                 }}
+                                                onLoadedData={() => setGalleryVideoErrors(current => {
+                                                    const next = new Set(current);
+                                                    next.delete(item.id);
+                                                    return next;
+                                                })}
                                             />
                                         ) : (
                                             <img src={item.url} alt={item.caption || 'Gallery Image'} loading="lazy" decoding="async" className="w-full h-full object-cover grayscale-[20%] group-hover:grayscale-0 transition-all duration-500 group-hover:scale-110" />
@@ -1397,7 +1449,8 @@ export default function MeClient({ config: initialConfig }: { config: MeConfig }
                                         )}
                                         {item.type === 'video' && galleryVideoErrors.has(item.id) && (
                                             <div className="absolute inset-x-3 bottom-3 rounded-lg border border-amber-300/30 bg-black/75 px-3 py-2 text-center text-[10px] text-amber-100 backdrop-blur" role="status">
-                                                Video could not start. Refresh once, or replace it in Me Admin.
+                                                <p>Video stream is temporarily unavailable.</p>
+                                                <button type="button" onClick={() => void retryGalleryVideo(item.id, item.url)} className="mt-1 font-mono uppercase tracking-wider text-white underline decoration-amber-200/50 underline-offset-2">Retry playback</button>
                                             </div>
                                         )}
                                     </div>

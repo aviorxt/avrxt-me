@@ -11,7 +11,7 @@ const contentSecurityPolicy = [
   "style-src 'self' 'unsafe-inline'",
   "img-src 'self' data: blob: https:",
   "media-src 'self' blob: https:",
-  "connect-src 'self' https://api.avrxt.dev https://*.supabase.co wss://*.supabase.co wss://api.lanyard.rest",
+  "connect-src 'self' https://api.avrxt.dev https://*.supabase.co wss://*.supabase.co wss://api.lanyard.rest https://stream.mux.com https://image.mux.com",
   "worker-src 'self' blob:",
   "frame-src 'self' https://www.youtube.com https://www.youtube-nocookie.com",
   "upgrade-insecure-requests",
