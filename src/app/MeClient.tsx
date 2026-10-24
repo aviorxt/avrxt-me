@@ -107,7 +107,8 @@ const ensureYouTubeIframeApi = () => {
     return w.__ytIframeApiPromise as Promise<void>;
 };
 
-export default function MeClient({ config }: { config: MeConfig }) {
+export default function MeClient({ config: initialConfig }: { config: MeConfig }) {
+    const [config, setConfig] = useState<MeConfig>(initialConfig);
     const [isPlaying, setIsPlaying] = useState(false);
     const [isMuted, setIsMuted] = useState(false);
     const [isImmersive, setIsImmersive] = useState(false);
@@ -140,6 +141,34 @@ export default function MeClient({ config }: { config: MeConfig }) {
     const [playingGalleryVideo, setPlayingGalleryVideo] = useState<string | null>(null);
     const [unmutedGalleryVideos, setUnmutedGalleryVideos] = useState<Set<string>>(() => new Set());
     const [galleryVideoErrors, setGalleryVideoErrors] = useState<Set<string>>(() => new Set());
+
+    // The editor writes this record from the main AVRXT dashboard. Subscribe to
+    // the same public record so open profile tabs reflect a save immediately,
+    // without requiring a browser refresh or an Amplify redeploy.
+    useEffect(() => {
+        const supabase = createClient();
+        const channel = supabase
+            .channel('avrxt_me_config_realtime')
+            .on(
+                'postgres_changes',
+                { event: '*', schema: 'public', table: 'me_config', filter: 'key=eq.main_config' },
+                (payload) => {
+                    const nextConfig = (payload.new as { data?: unknown } | null)?.data;
+                    if (nextConfig && typeof nextConfig === 'object') {
+                        setConfig(nextConfig as MeConfig);
+                    }
+                }
+            )
+            .subscribe();
+
+        return () => {
+            void supabase.removeChannel(channel);
+        };
+    }, []);
+
+    useEffect(() => {
+        setConfig(initialConfig);
+    }, [initialConfig]);
 
     const prepareGalleryVideo = useCallback(async (id: string, url: string) => {
         const video = galleryVideoRefs.current[id];
@@ -254,8 +283,9 @@ export default function MeClient({ config }: { config: MeConfig }) {
         };
     }, [weatherEnabled, config.profile.weatherCoordinates?.latitude, config.profile.weatherCoordinates?.longitude]);
 
-    // Discord presence changes comparatively slowly; use the API gateway cache and poll
-    // every five minutes rather than making every profile visit poll each minute.
+    // Discord presence is streamed directly from Lanyard's gateway. The HTTP
+    // endpoint remains a low-frequency fallback for browsers or networks that
+    // cannot keep a WebSocket open.
     useEffect(() => {
         const discordId = config.profile.presence?.discordId;
         if (!discordId) return;
@@ -276,16 +306,89 @@ export default function MeClient({ config }: { config: MeConfig }) {
             badgesNeeded;
         if (!presenceNeeded) return;
 
+        let isActive = true;
+        let socket: WebSocket | null = null;
+        let heartbeatId: number | undefined;
+        let reconnectId: number | undefined;
+        let fallbackId: number | undefined;
+        let reconnectAttempt = 0;
+
+        const clearHeartbeat = () => {
+            if (heartbeatId) window.clearInterval(heartbeatId);
+            heartbeatId = undefined;
+        };
+
         const fetchLanyard = async () => {
             try {
                 const res = await fetch(apiUrl(`/v1/discord/presence/${discordId}`, ''), { cache: 'no-store' });
                 const data = await res.json();
-                if (data.success) setLanyardData(data.data);
+                if (isActive && data.success) setLanyardData(data.data);
             } catch (e) { console.error(e); }
         };
-        fetchLanyard();
-        const id = window.setInterval(fetchLanyard, 5 * 60_000);
-        return () => window.clearInterval(id);
+
+        const connect = () => {
+            if (!isActive || typeof WebSocket === 'undefined') return;
+
+            try {
+                socket = new WebSocket('wss://api.lanyard.rest/socket');
+            } catch {
+                return;
+            }
+
+            socket.onmessage = (event) => {
+                try {
+                    const message = JSON.parse(event.data) as { op?: number; d?: any };
+
+                    // Hello: subscribe and begin the gateway heartbeat.
+                    if (message.op === 1) {
+                        const heartbeatInterval = Number(message.d?.heartbeat_interval) || 30_000;
+                        socket?.send(JSON.stringify({ op: 2, d: { subscribe_to_id: discordId } }));
+                        clearHeartbeat();
+                        heartbeatId = window.setInterval(() => {
+                            if (socket?.readyState === WebSocket.OPEN) {
+                                socket.send(JSON.stringify({ op: 3 }));
+                            }
+                        }, heartbeatInterval);
+                        return;
+                    }
+
+                    // INIT_STATE and PRESENCE_UPDATE share the presence payload
+                    // in `d`, so both can update the UI through one path.
+                    if (message.op === 0 && message.d && isActive) {
+                        setLanyardData(message.d);
+                    }
+                } catch {
+                    // Keep the current presence and allow the fallback/reconnect
+                    // path to recover from a malformed gateway frame.
+                }
+            };
+
+            socket.onopen = () => {
+                reconnectAttempt = 0;
+            };
+
+            socket.onclose = () => {
+                clearHeartbeat();
+                if (!isActive) return;
+                const retryDelay = Math.min(30_000, 1_000 * 2 ** reconnectAttempt);
+                reconnectAttempt += 1;
+                reconnectId = window.setTimeout(connect, retryDelay);
+            };
+
+            socket.onerror = () => socket?.close();
+        };
+
+        void fetchLanyard();
+        connect();
+        fallbackId = window.setInterval(() => void fetchLanyard(), 5 * 60_000);
+
+        return () => {
+            isActive = false;
+            clearHeartbeat();
+            if (reconnectId) window.clearTimeout(reconnectId);
+            if (fallbackId) window.clearInterval(fallbackId);
+            socket?.close();
+        };
     }, [
         config.profile.presence?.mode,
         config.profile.presence?.discordId,
